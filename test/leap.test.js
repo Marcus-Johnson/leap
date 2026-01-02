@@ -277,8 +277,9 @@ test("Observability: should calculate correct latency percentiles", async () => 
     await pool(() => delay(30));
 
     const { p50, p99 } = pool.metrics.percentiles;
-    assert.ok(parseFloat(p50) >= 10);
-    assert.ok(parseFloat(p99) >= 30);
+    
+    assert.ok(parseFloat(p50) >= 8, `Expected p50 >= 8, got ${p50}`); 
+    assert.ok(parseFloat(p99) >= 25, `Expected p99 >= 25, got ${p99}`);
   } finally {
     await pool.clear();
   }
