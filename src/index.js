@@ -2,11 +2,63 @@ import { Worker } from "node:worker_threads";
 import { PriorityHeap } from "./heap.js";
 
 export default function leap(initialConcurrency, globalOptions = {}) {
+  if (typeof initialConcurrency !== "number" || initialConcurrency < 1) {
+    throw new Error("initialConcurrency must be a number >= 1");
+  }
+
+  if (
+    globalOptions.minConcurrency !== undefined &&
+    globalOptions.minConcurrency < 1
+  ) {
+    throw new Error("minConcurrency must be >= 1");
+  }
+
+  if (
+    globalOptions.maxConcurrency !== undefined &&
+    globalOptions.minConcurrency !== undefined &&
+    globalOptions.maxConcurrency < globalOptions.minConcurrency
+  ) {
+    throw new Error("maxConcurrency must be >= minConcurrency");
+  }
+
+  if (
+    globalOptions.circuitThreshold !== undefined &&
+    globalOptions.circuitThreshold < 1
+  ) {
+    throw new Error("circuitThreshold must be >= 1");
+  }
+
+  if (globalOptions.batchSize !== undefined && globalOptions.batchSize < 1) {
+    throw new Error("batchSize must be >= 1");
+  }
+
+  if (globalOptions.interval !== undefined && globalOptions.interval < 1) {
+    throw new Error("interval must be >= 1");
+  }
+
   const subQueues = new Map();
   const emitter = globalOptions.emitter ?? null;
   const emit = (event, data) => emitter?.emit?.(event, data);
 
   const { onEnqueue, onDequeue, beforeExecute, afterExecute } = globalOptions;
+
+  const validateWorkerPath = (path) => {
+    if (typeof path !== "string" || path.length === 0) {
+      throw new Error("Worker path must be a non-empty string");
+    }
+    if (path.includes("..") || path.includes("~")) {
+      throw new Error("Worker path cannot contain '..' or '~'");
+    }
+    if (globalOptions.workerPathWhitelist) {
+      const isWhitelisted = globalOptions.workerPathWhitelist.some((allowed) =>
+        path.startsWith(allowed)
+      );
+      if (!isWhitelisted) {
+        throw new Error(`Worker path '${path}' is not in whitelist`);
+      }
+    }
+    return true;
+  };
 
   const createPoolInstance = (concurrency, options) => {
     const queue = new PriorityHeap();
@@ -14,13 +66,15 @@ export default function leap(initialConcurrency, globalOptions = {}) {
     const completedTasks = new Map();
     const pendingCache = new Map();
     const typeRateLimitState = new Map();
+    const circuitBreakers = new Map();
     const batchBuffers = new Map();
     const batchTimers = new Map();
     const workerPool = [];
     const activeWorkers = new Set();
     const rateLimitTimers = new Set();
-    const abortListeners = new WeakMap();
+    const abortListeners = new Map();
     const workerWaitingQueue = [];
+    const scheduledRateLimitChecks = new Set();
 
     let currentLoad = 0;
     let activeCount = 0;
@@ -30,11 +84,10 @@ export default function leap(initialConcurrency, globalOptions = {}) {
     let seqCounter = 0;
     let idleResolver = null;
     let errorsInCycle = [];
-    let circuitOpenUntil = 0;
-    let consecutiveFailures = 0;
     let latencies = [];
     let minPriority = Infinity;
     let maxPriority = -Infinity;
+    let priorityTracker = { min: Infinity, max: -Infinity, count: 0 };
 
     const config = {
       maxWorkerPoolSize: options.workerPoolSize ?? 0,
@@ -51,6 +104,10 @@ export default function leap(initialConcurrency, globalOptions = {}) {
       maxRetryDelay: options.maxRetryDelay ?? 10000,
       maintenanceInterval: options.interval ?? 1000,
       maxLatencyHistory: options.maxLatencyHistory ?? 10000,
+      maxErrorHistory: options.maxErrorHistory ?? 1000,
+      maxQueueSize: options.maxQueueSize ?? 10000,
+      adaptiveLatencyLow: options.adaptiveLatencyLow ?? 50,
+      adaptiveLatencyHigh: options.adaptiveLatencyHigh ?? 200,
     };
 
     const metrics = {
@@ -59,9 +116,7 @@ export default function leap(initialConcurrency, globalOptions = {}) {
       failedTasks: 0,
       startTime: Date.now(),
       allLatencies: [],
-      get isCircuitOpen() {
-        return Date.now() < circuitOpenUntil;
-      },
+      latencyLock: false,
       get throughput() {
         const elapsedSec = (Date.now() - this.startTime) / 1000;
         return elapsedSec > 0
@@ -74,12 +129,31 @@ export default function leap(initialConcurrency, globalOptions = {}) {
           : 0;
       },
       get percentiles() {
-        if (this.allLatencies.length === 0) return { p50: 0, p90: 0, p99: 0 };
-        const sorted = [...this.allLatencies].sort((a, b) => a - b);
-        const getP = (p) =>
-          sorted[Math.floor((p / 100) * (sorted.length - 1))].toFixed(2);
+        this.latencyLock = true;
+        const snapshot = [...this.allLatencies];
+        this.latencyLock = false;
+
+        if (snapshot.length === 0)
+          return { p50: "0.00", p90: "0.00", p99: "0.00" };
+        const sorted = snapshot.sort((a, b) => a - b);
+        const getP = (p) => {
+          const idx = Math.max(0, Math.ceil((p / 100) * sorted.length) - 1);
+          return sorted[idx].toFixed(2);
+        };
         return { p50: getP(50), p90: getP(90), p99: getP(99) };
       },
+    };
+
+    const getCircuitBreaker = (type) => {
+      const key = type || "default";
+      if (!circuitBreakers.has(key)) {
+        circuitBreakers.set(key, {
+          openUntil: 0,
+          consecutiveFailures: 0,
+          lock: false,
+        });
+      }
+      return circuitBreakers.get(key);
     };
 
     const maintenanceInterval = setInterval(() => {
@@ -89,7 +163,7 @@ export default function leap(initialConcurrency, globalOptions = {}) {
           options.agingBoost || 1,
           false
         );
-        updatePriorityBounds();
+        rebuildPriorityTracker();
       }
       if (options.decayThreshold && queue.size() > 0) {
         queue.adjustPriorities(
@@ -97,7 +171,7 @@ export default function leap(initialConcurrency, globalOptions = {}) {
           options.decayAmount || 1,
           true
         );
-        updatePriorityBounds();
+        rebuildPriorityTracker();
       }
 
       const cutoff = Date.now() - config.completedTaskCleanupMs;
@@ -112,27 +186,51 @@ export default function leap(initialConcurrency, globalOptions = {}) {
       }
       toDelete.forEach((id) => completedTasks.delete(id));
 
-      if (Date.now() >= circuitOpenUntil && circuitOpenUntil > 0) {
-        consecutiveFailures = 0;
-        circuitOpenUntil = 0;
-        emit("circuit:closed", {});
+      for (const [type, breaker] of circuitBreakers.entries()) {
+        const now = Date.now();
+        if (
+          now >= breaker.openUntil &&
+          breaker.openUntil > 0 &&
+          !breaker.lock
+        ) {
+          breaker.lock = true;
+          breaker.consecutiveFailures = 0;
+          breaker.openUntil = 0;
+          breaker.lock = false;
+          emit("circuit:closed", { type });
+        }
       }
 
       next();
     }, config.maintenanceInterval);
 
-    const updatePriorityBounds = () => {
+    const rebuildPriorityTracker = () => {
       if (queue.size() === 0) {
-        minPriority = Infinity;
-        maxPriority = -Infinity;
+        priorityTracker = { min: Infinity, max: -Infinity, count: 0 };
         return;
       }
-      minPriority = Infinity;
-      maxPriority = -Infinity;
+      let min = Infinity;
+      let max = -Infinity;
       for (let i = 0; i < queue.heap.length; i++) {
         const p = queue.heap[i].priority;
-        if (p < minPriority) minPriority = p;
-        if (p > maxPriority) maxPriority = p;
+        if (p < min) min = p;
+        if (p > max) max = p;
+      }
+      priorityTracker = { min, max, count: queue.size() };
+    };
+
+    const updatePriorityOnPush = (priority) => {
+      priorityTracker.count++;
+      if (priority < priorityTracker.min) priorityTracker.min = priority;
+      if (priority > priorityTracker.max) priorityTracker.max = priority;
+    };
+
+    const updatePriorityOnPop = () => {
+      priorityTracker.count--;
+      if (priorityTracker.count === 0) {
+        priorityTracker = { min: Infinity, max: -Infinity, count: 0 };
+      } else if (priorityTracker.count < 100) {
+        rebuildPriorityTracker();
       }
     };
 
@@ -141,13 +239,16 @@ export default function leap(initialConcurrency, globalOptions = {}) {
       const avg = latencies.reduce((a, b) => a + b, 0) / latencies.length;
       latencies = [];
 
-      if (avg < 50 && currentConcurrency < config.maxC) {
+      if (avg < config.adaptiveLatencyLow && currentConcurrency < config.maxC) {
         currentConcurrency++;
         emit("concurrency:adjust", {
           concurrency: currentConcurrency,
           reason: "low_latency",
         });
-      } else if (avg > 200 && currentConcurrency > config.minC) {
+      } else if (
+        avg > config.adaptiveLatencyHigh &&
+        currentConcurrency > config.minC
+      ) {
         currentConcurrency--;
         emit("concurrency:adjust", {
           concurrency: currentConcurrency,
@@ -162,298 +263,252 @@ export default function leap(initialConcurrency, globalOptions = {}) {
         options.rateLimits?.[taskType] ||
         (options.tasksPerInterval
           ? {
-              interval: config.maintenanceInterval,
+              interval: options.interval || 1000,
               tasksPerInterval: options.tasksPerInterval,
             }
           : null);
 
-      if (!limit) return true;
+      if (!limit) return false;
 
-      let state = typeRateLimitState.get(taskType);
-      if (!state) {
-        state = { lastWindowStart: Date.now(), tasksInWindow: 0 };
-        typeRateLimitState.set(taskType, state);
+      if (!typeRateLimitState.has(taskType)) {
+        typeRateLimitState.set(taskType, {
+          count: 0,
+          windowStart: Date.now(),
+        });
       }
 
+      const state = typeRateLimitState.get(taskType);
       const now = Date.now();
-      if (now - state.lastWindowStart > limit.interval) {
-        state.lastWindowStart = now;
-        state.tasksInWindow = 0;
+      const elapsed = now - state.windowStart;
+
+      if (elapsed >= limit.interval) {
+        state.count = 0;
+        state.windowStart = now;
       }
 
-      if (state.tasksInWindow >= limit.tasksPerInterval) {
-        const delay = limit.interval - (now - state.lastWindowStart);
-        const timerId = setTimeout(() => {
-          rateLimitTimers.delete(timerId);
-          next();
-        }, delay);
-        rateLimitTimers.add(timerId);
-        return false;
-      }
-
-      state.tasksInWindow++;
-      return true;
-    };
-
-    const next = () => {
-      if (isPaused) return;
-
-      const now = Date.now();
-      if (now < circuitOpenUntil) {
-        const delay = Math.max(circuitOpenUntil - now, 1000);
-        const timerId = setTimeout(() => {
-          rateLimitTimers.delete(timerId);
-          next();
-        }, delay);
-        rateLimitTimers.add(timerId);
-        return;
-      }
-
-      while (queue.size() > 0) {
-        const itemToProcess = queue.peek();
-        const weight = itemToProcess.weight || 1;
-
-        if (currentLoad + weight > currentConcurrency && activeCount > 0) break;
-
-        if (!checkRateLimit(itemToProcess.type)) break;
-
-        const item = queue.pop();
-        updatePriorityBounds();
-        onDequeue?.(item);
-        executeTask(item, weight);
-      }
-
-      checkIdle();
-    };
-
-    const checkIdle = () => {
-      if (
-        activeCount === 0 &&
-        queue.size() === 0 &&
-        blockedTasks.size === 0 &&
-        batchBuffers.size === 0
-      ) {
-        if (idleResolver) {
-          const result = {
-            errors: [...errorsInCycle],
-            failed: errorsInCycle.length > 0,
-            metrics,
-          };
-          errorsInCycle = [];
-          idleResolver(result);
-          idleResolver = null;
+      if (state.count >= limit.tasksPerInterval) {
+        const remainingTime = limit.interval - elapsed;
+        if (!scheduledRateLimitChecks.has(taskType)) {
+          scheduledRateLimitChecks.add(taskType);
+          const timerId = setTimeout(() => {
+            scheduledRateLimitChecks.delete(taskType);
+            next();
+          }, remainingTime);
+          rateLimitTimers.add(timerId);
         }
+        return true;
+      }
+
+      state.count++;
+      return false;
+    };
+
+    const getWorker = async (path) => {
+      let available = workerPool.find(
+        (w) => w.path === path && !w.busy && activeWorkers.has(w.worker)
+      );
+      if (available) {
+        available.busy = true;
+        return available;
+      }
+
+      if (workerPool.length < config.maxWorkerPoolSize) {
+        const worker = new Worker(path);
+        const wrapper = { worker, path, busy: true };
+        workerPool.push(wrapper);
+        activeWorkers.add(worker);
+        return wrapper;
+      }
+
+      return new Promise((resolve) => {
+        workerWaitingQueue.push({ path, resolve });
+      });
+    };
+
+    const releaseWorker = (wrapper) => {
+      wrapper.busy = false;
+      const waiting = workerWaitingQueue.findIndex(
+        (w) => w.path === wrapper.path
+      );
+      if (waiting !== -1) {
+        const { resolve } = workerWaitingQueue.splice(waiting, 1)[0];
+        wrapper.busy = true;
+        resolve(wrapper);
       }
     };
 
-    const executeTask = async (item, weight) => {
+    const terminateWorker = async (wrapper) => {
+      try {
+        activeWorkers.delete(wrapper.worker);
+        await wrapper.worker.terminate();
+      } catch (err) {
+        emit("worker:terminate:error", { path: wrapper.path, error: err });
+      }
+    };
+
+    const executeTask = async (taskData) => {
       const {
         task,
         resolve,
         reject,
-        signal,
-        timeout,
-        deadline,
-        id,
-        cacheKey,
-        workerConfig,
+        type,
         retryCount,
-        initialRetryCount = retryCount,
-      } = item;
+        timeout,
+        signal,
+        worker: workerOptions,
+      } = taskData;
+      const breaker = getCircuitBreaker(type);
+      const now = Date.now();
 
-      if ((deadline && Date.now() > deadline) || signal?.aborted) {
+      if (now < breaker.openUntil) {
         reject(
-          signal?.aborted
-            ? signal.reason || new Error("Aborted")
-            : new Error("Task deadline exceeded")
+          new Error(`Circuit breaker open for type: ${type || "default"}`)
         );
-        return next();
+        return;
       }
 
-      if (signal && !abortListeners.has(signal)) {
-        const abortHandler = () => {
-          if (item.isActive) {
-            reject(signal.reason || new Error("Aborted"));
-            item.isActive = false;
-          }
-        };
-        signal.addEventListener("abort", abortHandler);
-        abortListeners.set(signal, abortHandler);
-      }
-
-      item.isActive = true;
+      currentLoad += taskData.weight || 1;
+      taskData.isActive = true;
       activeCount++;
-      currentLoad += weight;
-      const memBefore = process.memoryUsage().heapUsed;
-      const profilerStart = performance.now();
-      beforeExecute?.(item);
+      beforeExecute?.(taskData);
 
-      let timeoutId;
-      try {
-        let result;
-        if (workerConfig) {
-          result = await handleWorkerTask(workerConfig);
-        } else {
-          const promises = [task()];
-          if (timeout > 0) {
-            promises.push(
-              new Promise((_, rej) => {
-                timeoutId = setTimeout(
-                  () => rej(new Error("Task Timeout")),
-                  timeout
-                );
-              })
-            );
+      const startTime = Date.now();
+      const startMem = process.memoryUsage().heapUsed;
+      let retries = 0;
+      let lastError = null;
+      const maxRetries = retryCount ?? options.retryCount ?? 0;
+
+      while (retries <= maxRetries) {
+        try {
+          let result;
+          let timeoutId;
+          let abortHandler;
+
+          const taskTimeout = timeout ?? 0;
+
+          const executePromise = workerOptions
+            ? (async () => {
+                const wrapper = await getWorker(workerOptions.path);
+                return new Promise((res, rej) => {
+                  const handleMessage = (msg) => {
+                    if (msg.type === "result") {
+                      wrapper.worker.off("message", handleMessage);
+                      wrapper.worker.off("error", handleError);
+                      releaseWorker(wrapper);
+                      res(msg.data);
+                    }
+                  };
+                  const handleError = (err) => {
+                    wrapper.worker.off("message", handleMessage);
+                    wrapper.worker.off("error", handleError);
+                    releaseWorker(wrapper);
+                    breaker.consecutiveFailures++;
+                    if (
+                      breaker.consecutiveFailures >= config.circuitThreshold
+                    ) {
+                      breaker.openUntil =
+                        Date.now() + config.circuitResetTimeout;
+                      emit("circuit:open", { type: type || "default" });
+                    }
+                    rej(err);
+                  };
+                  wrapper.worker.on("message", handleMessage);
+                  wrapper.worker.on("error", handleError);
+                  wrapper.worker.postMessage(workerOptions.data);
+                });
+              })()
+            : task();
+
+          const promises = [executePromise];
+
+          if (taskTimeout > 0) {
+            const timeoutPromise = new Promise((_, rej) => {
+              timeoutId = setTimeout(
+                () => rej(new Error("Task timeout")),
+                taskTimeout
+              );
+            });
+            promises.push(timeoutPromise);
           }
+
+          if (signal) {
+            const abortPromise = new Promise((_, rej) => {
+              abortHandler = () => rej(new Error("Task aborted"));
+              signal.addEventListener("abort", abortHandler);
+            });
+            promises.push(abortPromise);
+          }
+
           result = await Promise.race(promises);
-        }
 
-        if (!item.isActive) return;
+          if (timeoutId) clearTimeout(timeoutId);
+          if (abortHandler && signal) {
+            signal.removeEventListener("abort", abortHandler);
+            abortListeners.delete(taskData);
+          }
 
-        consecutiveFailures = 0;
-        if (id) {
-          completedTasks.set(id, Date.now());
-          const waiting = blockedTasks.get(id) || [];
-          blockedTasks.delete(id);
-          waiting.forEach((t) => checkDependencies(t));
-        }
+          const duration = Date.now() - startTime;
+          const memDelta = process.memoryUsage().heapUsed - startMem;
 
-        const duration = performance.now() - profilerStart;
-        latencies.push(duration);
-        if (latencies.length > 100) latencies.shift();
+          if (!metrics.latencyLock) {
+            metrics.allLatencies.push(duration);
+            if (metrics.allLatencies.length > config.maxLatencyHistory) {
+              metrics.allLatencies.shift();
+            }
+          }
 
-        metrics.allLatencies.push(duration);
-        if (metrics.allLatencies.length > config.maxLatencyHistory) {
-          metrics.allLatencies.shift();
-        }
+          latencies.push(duration);
+          if (latencies.length > 100) latencies.shift();
 
-        adjustConcurrency();
-        metrics.successfulTasks++;
-        afterExecute?.(item, {
-          duration,
-          memoryDelta: process.memoryUsage().heapUsed - memBefore,
-          status: "success",
-        });
-        resolve(result);
-      } catch (error) {
-        if (!item.isActive) return;
-
-        consecutiveFailures++;
-        metrics.failedTasks++;
-        if (consecutiveFailures >= config.circuitThreshold) {
-          circuitOpenUntil = Date.now() + config.circuitResetTimeout;
-          emit("circuit:open", { until: circuitOpenUntil });
-        }
-
-        if (
-          retryCount > 0 &&
-          !signal?.aborted &&
-          error.message !== "Task Timeout"
-        ) {
-          handleRetry(item, initialRetryCount);
+          breaker.consecutiveFailures = 0;
+          metrics.successfulTasks++;
+          afterExecute?.(taskData, {
+            duration,
+            memoryDelta: memDelta,
+            status: "success",
+          });
+          resolve(result);
           return;
-        }
+        } catch (err) {
+          lastError = err;
+          retries++;
 
-        errorsInCycle.push(error);
-        afterExecute?.(item, {
-          duration: performance.now() - profilerStart,
-          status: "error",
-          error: error.message,
-        });
-        reject(error);
-      } finally {
-        item.isActive = false;
-        if (cacheKey) pendingCache.delete(cacheKey);
-        if (timeoutId) clearTimeout(timeoutId);
-        metrics.totalTasks++;
-        activeCount--;
-        currentLoad -= weight;
-        next();
-      }
-    };
+          if (retries > maxRetries) {
+            const duration = Date.now() - startTime;
+            const memDelta = process.memoryUsage().heapUsed - startMem;
 
-    const handleWorkerTask = async (workerConfig) => {
-      let workerInstance = getWorker(workerConfig.path);
+            if (
+              err.message !== "Task aborted" &&
+              err.message !== "Task timeout"
+            ) {
+              breaker.consecutiveFailures++;
+              if (breaker.consecutiveFailures >= config.circuitThreshold) {
+                breaker.openUntil = Date.now() + config.circuitResetTimeout;
+                emit("circuit:open", { type: type || "default" });
+              }
+            }
 
-      if (!workerInstance) {
-        workerInstance = await new Promise((resolve) => {
-          workerWaitingQueue.push({ path: workerConfig.path, resolve });
-        });
-      }
+            metrics.failedTasks++;
+            errorsInCycle.push(err);
+            if (errorsInCycle.length > config.maxErrorHistory) {
+              errorsInCycle.shift();
+            }
+            afterExecute?.(taskData, {
+              duration,
+              memoryDelta: memDelta,
+              status: "failure",
+              error: err.message,
+            });
+            reject(err);
+            return;
+          }
 
-      activeWorkers.add(workerInstance);
-      return new Promise((res, rej) => {
-        workerInstance.once("message", res);
-        workerInstance.once("error", rej);
-        workerInstance.postMessage(workerConfig.data);
-      }).finally(() => {
-        activeWorkers.delete(workerInstance);
-        releaseWorker(workerInstance);
-      });
-    };
-
-    const handleRetry = (item, initialRetryCount) => {
-      const currentAttempt = initialRetryCount - item.retryCount + 1;
-      const backoffDelay =
-        config.initialRetryDelay * Math.pow(config.retryFactor, currentAttempt);
-      const jitteredDelay =
-        Math.min(backoffDelay, config.maxRetryDelay) *
-        (1 + Math.random() * 0.1);
-
-      setTimeout(() => {
-        queue.push({ ...item, retryCount: item.retryCount - 1 });
-        updatePriorityBounds();
-        next();
-      }, jitteredDelay);
-    };
-
-    const checkDependencies = (taskData) => {
-      const remaining = taskData.dependsOn.filter(
-        (depId) => !completedTasks.has(depId)
-      );
-      if (remaining.length === 0) {
-        queue.push(taskData);
-        updatePriorityBounds();
-        next();
-      } else {
-        remaining.forEach((depId) => {
-          if (!blockedTasks.has(depId)) blockedTasks.set(depId, []);
-          blockedTasks.get(depId).push(taskData);
-        });
-      }
-    };
-
-    const getWorker = (path) => {
-      let entry = workerPool.find((w) => w.path === path && !w.busy);
-      if (
-        !entry &&
-        (config.maxWorkerPoolSize <= 0 ||
-          workerPool.length < config.maxWorkerPoolSize)
-      ) {
-        const worker = new Worker(path);
-        entry = { worker, path, busy: true };
-        workerPool.push(entry);
-        return entry.worker;
-      }
-      if (entry) {
-        entry.busy = true;
-        return entry.worker;
-      }
-      return null;
-    };
-
-    const releaseWorker = (worker) => {
-      const entry = workerPool.find((w) => w.worker === worker);
-      if (entry) {
-        entry.busy = false;
-
-        const nextInLineIndex = workerWaitingQueue.findIndex(
-          (q) => q.path === entry.path
-        );
-        if (nextInLineIndex !== -1) {
-          const { resolve } = workerWaitingQueue.splice(nextInLineIndex, 1)[0];
-          entry.busy = true;
-          resolve(entry.worker);
+          const delay = Math.min(
+            config.initialRetryDelay *
+              Math.pow(config.retryFactor, retries - 1),
+            config.maxRetryDelay
+          );
+          await new Promise((r) => setTimeout(r, delay));
         }
       }
     };
@@ -463,46 +518,134 @@ export default function leap(initialConcurrency, globalOptions = {}) {
       if (!buffer || buffer.length === 0) return;
 
       batchBuffers.delete(batchKey);
-      if (batchTimers.has(batchKey)) {
-        clearTimeout(batchTimers.get(batchKey));
+      const timerId = batchTimers.get(batchKey);
+      if (timerId) {
+        clearTimeout(timerId);
         batchTimers.delete(batchKey);
       }
 
-      const metaTask = async () => {
-        const results = await Promise.allSettled(buffer.map((t) => t.task()));
-        results.forEach((res, i) => {
-          if (res.status === "fulfilled") buffer[i].resolve(res.value);
-          else buffer[i].reject(res.reason);
-        });
-      };
-
-      let maxPrio = buffer[0].priority;
-      for (let i = 1; i < buffer.length; i++) {
-        if (buffer[i].priority > maxPrio) maxPrio = buffer[i].priority;
+      for (const taskData of buffer) {
+        if (taskData.dependsOn && taskData.dependsOn.length > 0) {
+          checkDependencies(taskData);
+        } else {
+          queue.push(taskData);
+          updatePriorityOnPush(taskData.priority);
+        }
       }
-
-      queue.push({
-        task: metaTask,
-        priority: maxPrio,
-        weight: 1,
-        type: buffer[0].type,
-        seq: seqCounter++,
-      });
-      updatePriorityBounds();
       next();
     };
 
-    const poolInstance = (task, optionsParam = {}) => {
-      if (isDraining) return Promise.reject(new Error("Pool is draining"));
-      if (queue.size() >= (options.maxQueueSize ?? Infinity))
-        return Promise.reject(new Error("Queue size limit exceeded"));
+    const checkDependencies = (taskData) => {
+      const unresolved = taskData.dependsOn.filter(
+        (id) => !completedTasks.has(id)
+      );
+      if (unresolved.length === 0) {
+        queue.push(taskData);
+        updatePriorityOnPush(taskData.priority);
+        next();
+      } else {
+        for (const depId of unresolved) {
+          if (!blockedTasks.has(depId)) blockedTasks.set(depId, []);
+          const blocked = blockedTasks.get(depId);
+          if (!blocked.includes(taskData)) {
+            blocked.push(taskData);
+          }
+        }
+      }
+    };
+
+    const next = () => {
+      if (isPaused || isDraining) return;
+
+      if (queue.size() === 0) {
+        if (
+          activeCount === 0 &&
+          blockedTasks.size === 0 &&
+          batchBuffers.size === 0 &&
+          idleResolver
+        ) {
+          idleResolver({
+            errors: errorsInCycle,
+            failed: errorsInCycle.length > 0,
+            metrics,
+          });
+          idleResolver = null;
+          errorsInCycle = [];
+        }
+        return;
+      }
+
+      while (activeCount < currentConcurrency && queue.size() > 0) {
+        const taskData = queue.peek();
+        if (!taskData) break;
+
+        const weight = taskData.weight || 1;
+        if (activeCount > 0 && currentLoad + weight > currentConcurrency) {
+          break;
+        }
+
+        if (checkRateLimit(taskData.type)) break;
+
+        queue.pop();
+        updatePriorityOnPop();
+        onDequeue?.(taskData);
+
+        if (taskData.deadline && Date.now() > taskData.deadline) {
+          taskData.reject(new Error("Task deadline exceeded"));
+          metrics.failedTasks++;
+          continue;
+        }
+
+        metrics.totalTasks++;
+
+        executeTask(taskData).finally(() => {
+          currentLoad -= taskData.weight || 1;
+          taskData.isActive = false;
+          activeCount--;
+
+          if (taskData.id) {
+            completedTasks.set(taskData.id, Date.now());
+            const blocked = blockedTasks.get(taskData.id);
+            if (blocked) {
+              blockedTasks.delete(taskData.id);
+              for (const waiting of blocked) {
+                checkDependencies(waiting);
+              }
+            }
+          }
+
+          if (taskData.cacheKey) {
+            pendingCache.delete(taskData.cacheKey);
+          }
+
+          adjustConcurrency();
+          next();
+        });
+      }
+    };
+
+    const poolInstance = (task, options) => {
+      if (typeof task !== "function") {
+        throw new Error("Task must be a function");
+      }
 
       const opts =
-        typeof optionsParam === "number"
-          ? { priority: optionsParam }
-          : optionsParam;
-      if (opts.cacheKey && pendingCache.has(opts.cacheKey))
-        return pendingCache.get(opts.cacheKey);
+        typeof options === "number" ? { priority: options } : options || {};
+
+      if (opts.worker) validateWorkerPath(opts.worker.path);
+
+      if (opts.cacheKey) {
+        const cached = pendingCache.get(opts.cacheKey);
+        if (cached && cached.task === task) return cached.promise;
+      }
+
+      if (isDraining) {
+        return Promise.reject(new Error("Pool is draining"));
+      }
+
+      if (queue.size() >= config.maxQueueSize) {
+        return Promise.reject(new Error("Queue is full"));
+      }
 
       const taskPromise = new Promise((resolve, reject) => {
         const taskData = {
@@ -519,29 +662,76 @@ export default function leap(initialConcurrency, globalOptions = {}) {
         };
         onEnqueue?.(taskData);
 
+        if (opts.signal) {
+          const abortHandler = () => {
+            reject(new Error("Task aborted"));
+            poolInstance.cancel((t) => t === taskData);
+          };
+          opts.signal.addEventListener("abort", abortHandler);
+          abortListeners.set(taskData, abortHandler);
+        }
+
         if (opts.batchKey) {
           if (!batchBuffers.has(opts.batchKey))
             batchBuffers.set(opts.batchKey, []);
           const buffer = batchBuffers.get(opts.batchKey);
           buffer.push(taskData);
+
           if (buffer.length >= config.batchSize) {
             flushBatch(opts.batchKey);
           } else if (!batchTimers.has(opts.batchKey)) {
-            batchTimers.set(
-              opts.batchKey,
-              setTimeout(() => flushBatch(opts.batchKey), config.batchTimeout)
-            );
+            const timerId = setTimeout(() => {
+              flushBatch(opts.batchKey);
+            }, config.batchTimeout);
+            batchTimers.set(opts.batchKey, timerId);
           }
         } else if (taskData.dependsOn.length > 0) {
           checkDependencies(taskData);
         } else {
           queue.push(taskData);
-          updatePriorityBounds();
+          updatePriorityOnPush(taskData.priority);
           next();
         }
       });
 
-      if (opts.cacheKey) pendingCache.set(opts.cacheKey, taskPromise);
+      taskPromise.catch(() => {
+        const opts =
+          typeof options === "number" ? { priority: options } : options || {};
+
+        const taskData = Array.from(abortListeners.keys()).find(
+          (t) => t.task === task
+        );
+
+        if (taskData) {
+          const handler = abortListeners.get(taskData);
+          if (handler && taskData.signal) {
+            taskData.signal.removeEventListener("abort", handler);
+          }
+          abortListeners.delete(taskData);
+        }
+
+        if (opts.batchKey) {
+          const buffer = batchBuffers.get(opts.batchKey);
+          if (buffer) {
+            const filtered = buffer.filter((t) => t.task !== task);
+            if (filtered.length === 0) {
+              batchBuffers.delete(opts.batchKey);
+              const timer = batchTimers.get(opts.batchKey);
+              if (timer) {
+                clearTimeout(timer);
+                batchTimers.delete(opts.batchKey);
+              }
+            } else {
+              batchBuffers.set(opts.batchKey, filtered);
+            }
+          }
+        }
+      });
+
+      if (opts.cacheKey) {
+        pendingCache.set(opts.cacheKey, { task, promise: taskPromise });
+      }
+
       return taskPromise;
     };
 
@@ -576,10 +766,22 @@ export default function leap(initialConcurrency, globalOptions = {}) {
               (query.id && t.id === query.id) ||
               (query.tag && t.tags?.includes(query.tag));
       let count = 0;
+      let minRemoved = Infinity;
+      let maxRemoved = -Infinity;
 
       queue.remove((t) => {
         if (match(t)) {
           if (t.cacheKey) pendingCache.delete(t.cacheKey);
+
+          const handler = abortListeners.get(t);
+          if (handler && t.signal) {
+            t.signal.removeEventListener("abort", handler);
+          }
+          abortListeners.delete(t);
+
+          if (t.priority < minRemoved) minRemoved = t.priority;
+          if (t.priority > maxRemoved) maxRemoved = t.priority;
+
           t.reject(new Error("Task cancelled via API"));
           count++;
           return true;
@@ -592,6 +794,13 @@ export default function leap(initialConcurrency, globalOptions = {}) {
         const filtered = buffer.filter((task) => {
           if (match(task)) {
             if (task.cacheKey) pendingCache.delete(task.cacheKey);
+
+            const handler = abortListeners.get(task);
+            if (handler && task.signal) {
+              task.signal.removeEventListener("abort", handler);
+            }
+            abortListeners.delete(task);
+
             task.reject(new Error("Task cancelled via API"));
             count++;
             return false;
@@ -617,6 +826,13 @@ export default function leap(initialConcurrency, globalOptions = {}) {
           if (match(task)) {
             if (!cancelledInBlocked.has(task)) {
               if (task.cacheKey) pendingCache.delete(task.cacheKey);
+
+              const handler = abortListeners.get(task);
+              if (handler && task.signal) {
+                task.signal.removeEventListener("abort", handler);
+              }
+              abortListeners.delete(task);
+
               task.reject(new Error("Task cancelled via API"));
               count++;
               cancelledInBlocked.add(task);
@@ -633,7 +849,13 @@ export default function leap(initialConcurrency, globalOptions = {}) {
         }
       }
 
-      if (count > 0) updatePriorityBounds();
+      if (
+        count > 0 &&
+        (minRemoved <= priorityTracker.min || maxRemoved >= priorityTracker.max)
+      ) {
+        rebuildPriorityTracker();
+      }
+
       return count;
     };
 
@@ -648,45 +870,111 @@ export default function leap(initialConcurrency, globalOptions = {}) {
 
     poolInstance.remove = (predicate) => {
       const result = queue.remove(predicate);
-      if (result) updatePriorityBounds();
+      if (result) rebuildPriorityTracker();
       return result;
     };
 
-    poolInstance.clear = () => {
+    poolInstance.clear = async () => {
       clearInterval(maintenanceInterval);
       rateLimitTimers.forEach(clearTimeout);
       rateLimitTimers.clear();
+
+      const queuedTasks = [...queue.heap];
       queue.clear();
+
+      activeCount = 0;
+      currentLoad = 0;
+
+      for (const task of queuedTasks) {
+        task.reject(new Error("Pool cleared"));
+      }
+
+      for (const [, tasks] of blockedTasks) {
+        for (const task of tasks) {
+          task.reject(new Error("Pool cleared"));
+        }
+      }
       blockedTasks.clear();
-      completedTasks.clear();
-      pendingCache.clear();
+
+      for (const [, buffer] of batchBuffers) {
+        for (const task of buffer) {
+          task.reject(new Error("Pool cleared"));
+        }
+      }
       batchBuffers.clear();
+
       batchTimers.forEach(clearTimeout);
       batchTimers.clear();
-      workerPool.forEach((w) => w.worker.terminate());
+
+      completedTasks.clear();
+      pendingCache.clear();
+      circuitBreakers.clear();
+
+      for (const [task, handler] of abortListeners.entries()) {
+        if (task.signal) {
+          task.signal.removeEventListener("abort", handler);
+        }
+      }
+      abortListeners.clear();
+
+      const terminationPromises = workerPool.map((w) => terminateWorker(w));
+      await Promise.allSettled(terminationPromises);
+
       workerPool.length = 0;
       activeWorkers.clear();
       workerWaitingQueue.length = 0;
 
       if (poolInstance.useQueue) {
         for (const sub of subQueues.values()) {
-          sub.clear();
+          await sub.clear();
         }
         subQueues.clear();
       }
     };
 
     poolInstance.map = async (items, fn, opts) => {
+      const optsObj =
+        typeof opts === "number" ? { priority: opts } : opts || {};
+      const throwOnError = optsObj.throwOnError ?? true;
+
       const results = [];
       for (const item of items) {
-        results.push(poolInstance(() => fn(item), opts));
+        results.push(poolInstance(() => fn(item), optsObj));
       }
-      return Promise.all(results);
+
+      if (throwOnError) {
+        return Promise.all(results);
+      } else {
+        const settled = await Promise.allSettled(results);
+        return settled.map((result) =>
+          result.status === "fulfilled" ? result.value : result.reason
+        );
+      }
+    };
+
+    poolInstance.getWorkerHealth = () => {
+      return workerPool.map((w) => ({
+        path: w.path,
+        busy: w.busy,
+        active: activeWorkers.has(w.worker),
+      }));
     };
 
     Object.defineProperties(poolInstance, {
       activeCount: { get: () => activeCount },
-      pendingCount: { get: () => queue.size() + blockedTasks.size },
+      pendingCount: {
+        get: () => {
+          const blockedCount = Array.from(blockedTasks.values()).reduce(
+            (acc, tasks) => acc + tasks.length,
+            0
+          );
+          const batchCount = Array.from(batchBuffers.values()).reduce(
+            (acc, tasks) => acc + tasks.length,
+            0
+          );
+          return queue.size() + blockedCount + batchCount;
+        },
+      },
       currentLoad: { get: () => currentLoad },
       concurrency: { get: () => currentConcurrency },
       isDraining: { get: () => isDraining },

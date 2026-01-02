@@ -1,5 +1,5 @@
 {
-  "name": "leap", 
+  "name": "leap",
   "version": "1.0.0",
   "type": "module",
   "description": "High-performance priority promise pool with concurrency control",
@@ -30,6 +30,17 @@
     "priority-queue",
     "concurrency",
     "async",
-    "leap"
+    "leap",
+    "rate-limit",
+    "circuit-breaker",
+    "worker-threads",
+    "task-scheduler",
+    "dag",
+    "batching",
+    "retry",
+    "backoff",
+    "adaptive-concurrency",
+    "throttling",
+    "node-js"
   ]
 }

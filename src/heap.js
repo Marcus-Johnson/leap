@@ -51,8 +51,6 @@ export class PriorityHeap {
     if (size <= 1) return;
 
     let changed = false;
-    let eligibleCount = 0;
-
     const targetPriority = isDecay
       ? this.heap.reduce((min, item) => Math.min(min, item.priority), Infinity)
       : this.heap.reduce(
@@ -67,19 +65,17 @@ export class PriorityHeap {
         : item.priority < targetPriority;
 
       if (isEligible) {
-        eligibleCount++;
         item.cycles = (item.cycles || 0) + 1;
         if (item.cycles >= threshold) {
-          item.priority = isDecay
-            ? item.priority - amount
-            : item.priority + amount;
+          item.priority = targetPriority;
           item.cycles = 0;
           changed = true;
         }
+      } else {
+        item.cycles = 0;
       }
     }
 
-    if (eligibleCount === 0) return;
     if (changed) this._rebuild();
   }
 

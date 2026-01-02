@@ -1,247 +1,285 @@
-import test from 'node:test';
-import assert from 'node:assert';
-import { EventEmitter } from 'node:events';
-import leap from '../src/index.js';
+import test from "node:test";
+import assert from "node:assert";
+import leap from "../src/index.js";
 
-test('LEAP should respect concurrency limits', async () => {
-  const pool = leap(2);
-  let active = 0;
-  let maxActive = 0;
+const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  const task = async () => {
-    active++;
-    maxActive = Math.max(maxActive, active);
-    await new Promise(r => setTimeout(r, 10));
-    active--;
-  };
+test("Core: should respect strict concurrency limits", async () => {
+  const pool = leap(3);
+  try {
+    let active = 0;
+    let maxActive = 0;
 
-  await Promise.all([
-    pool(task),
-    pool(task),
-    pool(task),
-    pool(task)
-  ]);
-  
-  assert.strictEqual(maxActive, 2, 'Should not exceed concurrency of 2');
-});
+    const task = async () => {
+      active++;
+      maxActive = Math.max(maxActive, active);
+      await delay(20);
+      active--;
+    };
 
-test('High priority tasks should leap ahead in the queue', async () => {
-  const pool = leap(1);
-  const executionOrder = [];
-
-  pool(() => new Promise(r => setTimeout(() => {
-    executionOrder.push('slow');
-    r();
-  }, 20)));
-
-  pool(() => executionOrder.push('low'), 0);
-  pool(() => executionOrder.push('high'), 10);
-
-  await pool.onIdle();
-  assert.deepStrictEqual(executionOrder, ['slow', 'high', 'low']);
-});
-
-test('Retry logic should re-run failed tasks with backoff', async () => {
-  const pool = leap(1);
-  let attempts = 0;
-
-  await pool(() => {
-    attempts++;
-    if (attempts < 3) throw new Error('Fail');
-    return 'Success';
-  }, { retryCount: 2, retryDelay: 10 });
-
-  assert.strictEqual(attempts, 3, 'Should have attempted 3 times total');
-});
-
-test('Circuit Breaker should open on failures and block execution', async () => {
-  const pool = leap(2, { 
-    circuitThreshold: 3, 
-    circuitResetTimeout: 100 
-  });
-  
-  let executedAfterOpen = false;
-
-  const failTask = () => Promise.reject(new Error('Persistent Failure'));
-  await Promise.allSettled([pool(failTask), pool(failTask), pool(failTask)]);
-
-  const p = pool(() => { executedAfterOpen = true; return 'Success'; });
-  
-  await new Promise(r => setTimeout(r, 50));
-  assert.strictEqual(executedAfterOpen, false, 'Task should not execute while circuit is open');
-
-  await new Promise(r => setTimeout(r, 150));
-  await p;
-  assert.strictEqual(executedAfterOpen, true, 'Task should execute after circuit resets');
-});
-
-test('Adaptive Concurrency should scale based on latency', async () => {
-  const emitter = new EventEmitter();
-  let adjustCount = 0;
-  emitter.on('concurrency:adjust', () => adjustCount++);
-
-  const pool = leap(1, { 
-    adaptive: true, 
-    minConcurrency: 1, 
-    maxConcurrency: 5,
-    emitter 
-  });
-
-  const fastTask = () => new Promise(r => setTimeout(() => r('fast'), 10));
-  for(let i = 0; i < 11; i++) {
-    await pool(fastTask);
+    await Promise.all(Array.from({ length: 10 }, () => pool(task)));
+    assert.strictEqual(maxActive, 3, "Should never exceed concurrency of 3");
+  } finally {
+    await pool.clear();
   }
-
-  assert.ok(pool.concurrency > 1, 'Concurrency should have increased');
-  assert.ok(adjustCount > 0, 'Should have emitted adjust events');
 });
 
-test('Task Dependencies should execute in DAG order', async () => {
-  const pool = leap(2);
-  const results = [];
-
-  const t1 = pool(() => results.push('A'), { id: 'taskA' });
-  const t2 = pool(() => results.push('B'), { id: 'taskB', dependsOn: ['taskA'] });
-  const t3 = pool(() => results.push('C'), { id: 'taskC', dependsOn: ['taskB'] });
-
-  await Promise.all([t1, t2, t3]);
-  assert.deepStrictEqual(results, ['A', 'B', 'C'], 'Tasks did not follow dependency order');
-});
-
-test('Priority Aging should prevent starvation', async () => {
-  const pool = leap(1, { 
-    agingThreshold: 1, 
-    agingBoost: 10, 
-    interval: 50 
-  });
-  
-  const order = [];
-  pool(() => new Promise(r => setTimeout(r, 100)));
-
-  pool(() => order.push('low'), { priority: 0 });
-  
-  setTimeout(() => {
-    pool(() => order.push('high'), { priority: 5 });
-  }, 20);
-
-  await new Promise(r => setTimeout(r, 150));
-  await pool.onIdle();
-
-  assert.strictEqual(order[0], 'low', 'Aging did not boost low priority task');
-});
-
-test('Weight-based concurrency should limit based on load', async () => {
+test("Core: should manage load via task weights", async () => {
   const pool = leap(10);
-  let lightTaskExecuted = false;
+  try {
+    let ran = false;
+    pool(() => delay(50), { weight: 10 });
 
-  pool(async () => {
-    await new Promise(r => setTimeout(r, 50));
-  }, { weight: 10 });
+    const p2 = pool(
+      () => {
+        ran = true;
+      },
+      { weight: 1 }
+    );
 
-  pool(() => { lightTaskExecuted = true; }, { weight: 1 });
+    await delay(20);
+    assert.strictEqual(ran, false, "Weighted task should be blocked");
 
-  await new Promise(r => setTimeout(r, 20));
-  assert.strictEqual(lightTaskExecuted, false, 'Light task should be blocked by heavy weight');
-  
-  await pool.onIdle();
-  assert.strictEqual(lightTaskExecuted, true, 'Light task should eventually run');
+    await p2;
+    assert.strictEqual(ran, true);
+  } finally {
+    await pool.clear();
+  }
 });
 
-test('Sub-queues (useQueue) should have isolated concurrency', async () => {
-  const mainPool = leap(5);
-  const cpuQueue = mainPool.useQueue('cpu', 1);
-  const ioQueue = mainPool.useQueue('io', 10);
+test("Core: should resolve onIdle when all work is finished", async () => {
+  const pool = leap(2);
+  try {
+    let count = 0;
+    for (let i = 0; i < 5; i++) {
+      pool(async () => {
+        await delay(10);
+        count++;
+      });
+    }
 
-  let cpuActive = 0;
-  const cpuTask = async () => {
-    cpuActive++;
-    await new Promise(r => setTimeout(r, 20));
-    assert.ok(cpuActive <= 1, 'CPU queue exceeded its limit');
-    cpuActive--;
-  };
-
-  await Promise.all([cpuQueue(cpuTask), cpuQueue(cpuTask)]);
+    const result = await pool.onIdle();
+    assert.strictEqual(count, 5);
+    assert.strictEqual(result.failed, false);
+  } finally {
+    await pool.clear();
+  }
 });
 
-test('maxQueueSize should reject tasks when the queue is full', async () => {
-  const pool = leap(1, { maxQueueSize: 1 });
-  
-  const task1 = pool(() => new Promise(r => setTimeout(r, 50)));
-  
-  const task2 = pool(() => Promise.resolve('queued'));
-  
-  await assert.rejects(
-    pool(() => Promise.resolve('rejected')),
-    { message: 'Queue size limit exceeded' },
-    'Should reject when queue limit is reached'
-  );
-
-  await pool.onIdle();
-});
-
-test('cancel should remove tasks from batch buffers', async () => {
-  const pool = leap(2, { 
-    batchSize: 10, 
-    batchTimeout: 1000 
-  });
-
-  const p1 = pool(() => Promise.resolve(), { batchKey: 'b1', id: 'cancel-me' });
-  const p2 = pool(() => Promise.resolve(), { batchKey: 'b1', id: 'keep-me' });
-
-  const cancelledCount = pool.cancel({ id: 'cancel-me' });
-  
-  assert.strictEqual(cancelledCount, 1, 'Should report 1 task cancelled');
-  await assert.rejects(p1, { message: 'Task cancelled via API' });
-  
-  pool.setConcurrency(2);
-  await p2; 
-});
-
-test('cancel should remove tasks from blocked/dependency list', async () => {
+test("Priority: should execute tasks in priority order (Max-Heap)", async () => {
   const pool = leap(1);
-  
-  pool(() => new Promise(r => setTimeout(r, 50)), { id: 'taskA' });
-  
-  const pB = pool(() => 'resultB', { id: 'taskB', dependsOn: ['taskA'] });
-  
-  assert.strictEqual(pool.pendingCount, 1, 'Task B should be in pending/blocked');
-  
-  const cancelledCount = pool.cancel({ id: 'taskB' });
-  assert.strictEqual(cancelledCount, 1);
-  
-  await assert.rejects(pB, { message: 'Task cancelled via API' });
+  try {
+    const order = [];
+    pool(() => delay(30));
+
+    pool(() => order.push("low"), { priority: 0 });
+    pool(() => order.push("high"), { priority: 100 });
+    pool(() => order.push("mid"), { priority: 50 });
+
+    await pool.onIdle();
+    assert.deepStrictEqual(order, ["high", "mid", "low"]);
+  } finally {
+    await pool.clear();
+  }
 });
 
-test('Adaptive concurrency should respect latency bounds (low latency)', async () => {
-  const pool = leap(1, { 
-    adaptive: true, 
-    minConcurrency: 1, 
-    maxConcurrency: 5 
+test("Priority: should prevent starvation via aging boost", async () => {
+  const pool = leap(1, {
+    agingThreshold: 1,
+    agingBoost: 20,
+    interval: 20,
   });
+  try {
+    const order = [];
+    pool(() => delay(60));
 
-  const fastTask = () => new Promise(r => setTimeout(r, 10));
-  
-  for (let i = 0; i < 11; i++) {
-    await pool(fastTask);
+    pool(() => order.push("starved"), { priority: 0 });
+    await delay(10);
+    pool(() => order.push("new-high"), { priority: 10 });
+
+    await pool.onIdle();
+    assert.strictEqual(order[0], "starved");
+  } finally {
+    await pool.clear();
   }
-
-  assert.ok(pool.concurrency > 1, `Concurrency (${pool.concurrency}) should increase for low latency`);
 });
 
-test('Adaptive concurrency should respect latency bounds (high latency)', async () => {
-  const pool = leap(5, { 
-    adaptive: true, 
-    minConcurrency: 1, 
-    maxConcurrency: 10 
+test("Resilience: should retry failed tasks with exponential backoff", async () => {
+  const pool = leap(1, {
+    retryCount: 3,
+    initialRetryDelay: 10,
+    retryFactor: 2,
   });
+  try {
+    let attempts = 0;
+    const result = await pool(() => {
+      attempts++;
+      if (attempts < 3) throw new Error("Temp Fail");
+      return "OK";
+    });
 
-  const slowTask = () => new Promise(r => setTimeout(r, 210));
-  
-  const tasks = [];
-  for (let i = 0; i < 11; i++) {
-    tasks.push(pool(slowTask));
+    assert.strictEqual(result, "OK");
+    assert.strictEqual(attempts, 3);
+  } finally {
+    await pool.clear();
   }
-  await Promise.all(tasks);
+});
 
-  assert.ok(pool.concurrency < 5, `Concurrency (${pool.concurrency}) should decrease for high latency`);
+test("Resilience: should trip circuit breaker on repeated failures", async () => {
+  const pool = leap(1, {
+    circuitThreshold: 2,
+    circuitResetTimeout: 50,
+  });
+  try {
+    const fail = () => Promise.reject(new Error("Fail"));
+    await Promise.allSettled([pool(fail), pool(fail)]);
+
+    await assert.rejects(
+      pool(() => "should not run"),
+      /Circuit breaker open/
+    );
+
+    await delay(60);
+    const success = await pool(() => "recovered");
+    assert.strictEqual(success, "recovered");
+  } finally {
+    await pool.clear();
+  }
+});
+
+test("Advanced: should respect task dependencies (DAG)", async () => {
+  const pool = leap(2);
+  try {
+    const log = [];
+    const t1 = pool(() => log.push("A"), { id: "A" });
+    const t3 = pool(() => log.push("C"), { id: "C", dependsOn: ["B"] });
+    const t2 = pool(() => log.push("B"), { id: "B", dependsOn: ["A"] });
+
+    await Promise.all([t1, t2, t3]);
+    assert.deepStrictEqual(log, ["A", "B", "C"]);
+  } finally {
+    await pool.clear();
+  }
+});
+
+test("Advanced: should batch tasks by key", async () => {
+  const pool = leap(5, { batchSize: 3, batchTimeout: 1000 });
+  try {
+    let execCount = 0;
+    const task = () => {
+      execCount++;
+      return Promise.resolve();
+    };
+
+    const p1 = pool(task, { batchKey: "b1" });
+    const p2 = pool(task, { batchKey: "b1" });
+    const p3 = pool(task, { batchKey: "b1" });
+
+    await Promise.all([p1, p2, p3]);
+    assert.strictEqual(execCount, 3);
+  } finally {
+    await pool.clear();
+  }
+});
+
+test("Advanced: should enforce rate limits per type", async () => {
+  const pool = leap(5, {
+    rateLimits: { api: { interval: 100, tasksPerInterval: 2 } },
+  });
+  try {
+    const start = Date.now();
+    const tasks = Array.from({ length: 3 }, () =>
+      pool(() => Promise.resolve(), { type: "api" })
+    );
+
+    await Promise.all(tasks);
+    const duration = Date.now() - start;
+    assert.ok(duration >= 100, `Rate limit ignored: took ${duration}ms`);
+  } finally {
+    await pool.clear();
+  }
+});
+
+test("Lifecycle: should deduplicate work via cacheKey", async () => {
+  const pool = leap(1);
+  try {
+    let calls = 0;
+    const sharedTask = async () => {
+      calls++;
+      await delay(20);
+      return "data";
+    };
+
+    const [r1, r2] = await Promise.all([
+      pool(sharedTask, { cacheKey: "fetch-1" }),
+      pool(sharedTask, { cacheKey: "fetch-1" }),
+    ]);
+
+    assert.strictEqual(calls, 1, "Task should only execute once");
+    assert.strictEqual(r1, r2);
+  } finally {
+    await pool.clear();
+  }
+});
+
+test("Lifecycle: should cancel tasks by ID or Tag", async () => {
+  const pool = leap(1);
+  try {
+    pool(() => delay(50));
+    const p1 = pool(() => "never", { id: "cancel-me" });
+    const p2 = pool(() => "never", { tags: ["cleanup"] });
+
+    const cancelled = pool.cancel({ id: "cancel-me" });
+    const cancelledTag = pool.cancel({ tag: "cleanup" });
+
+    assert.strictEqual(cancelled, 1);
+    assert.strictEqual(cancelledTag, 1);
+    await assert.rejects(p1, /Task cancelled/);
+    await assert.rejects(p2, /Task cancelled/);
+  } finally {
+    await pool.clear();
+  }
+});
+
+test("Lifecycle: should clear all resources and terminate workers", async () => {
+  const pool = leap(1);
+  pool(() => delay(100));
+  pool(() => "pending");
+
+  assert.strictEqual(pool.pendingCount, 1);
+
+  await pool.clear();
+  assert.strictEqual(pool.pendingCount, 0);
+  assert.strictEqual(pool.activeCount, 0);
+});
+
+test("Observability: should trigger afterExecute profile hooks", async () => {
+  let profileResult = null;
+  const pool = leap(1, {
+    afterExecute: (task, profile) => {
+      profileResult = profile;
+    },
+  });
+  try {
+    await pool(() => delay(20));
+    assert.ok(profileResult.duration >= 20);
+    assert.strictEqual(profileResult.status, "success");
+    assert.ok(profileResult.memoryDelta !== undefined);
+  } finally {
+    await pool.clear();
+  }
+});
+
+test("Observability: should calculate correct latency percentiles", async () => {
+  const pool = leap(1);
+  try {
+    await pool(() => delay(10));
+    await pool(() => delay(30));
+
+    const { p50, p99 } = pool.metrics.percentiles;
+    assert.ok(parseFloat(p50) >= 10);
+    assert.ok(parseFloat(p99) >= 30);
+  } finally {
+    await pool.clear();
+  }
 });

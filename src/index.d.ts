@@ -8,7 +8,7 @@ export interface TaskOptions {
   weight?: number;
   type?: string;
   cacheKey?: string;
-  batchKey?: string; 
+  batchKey?: string;
   id?: string | number;
   tags?: string[];
   metadata?: Record<string, any>;
@@ -37,11 +37,18 @@ export interface Metrics {
   };
 }
 
+export interface WorkerHealth {
+  path: string;
+  busy: boolean;
+  active: boolean;
+}
+
 export interface GlobalOptions {
   maxQueueSize?: number;
   workerPoolSize?: number;
-  batchSize?: number;     
-  batchTimeout?: number; 
+  workerPathWhitelist?: string[];
+  batchSize?: number;
+  batchTimeout?: number;
   rateLimits?: Record<string, RateLimit>;
   circuitThreshold?: number;
   circuitResetTimeout?: number;
@@ -58,16 +65,22 @@ export interface GlobalOptions {
   agingBoost?: number;
   decayThreshold?: number;
   decayAmount?: number;
+  maxLatencyHistory?: number;
+  maxErrorHistory?: number;
+  completedTaskCleanupMs?: number;
   emitter?: any;
   onEnqueue?: (task: any) => void;
   onDequeue?: (task: any) => void;
   beforeExecute?: (task: any) => void;
-  afterExecute?: (task: any, profile: { 
-    duration: number; 
-    memoryDelta: number; 
-    status: string; 
-    error?: string 
-  }) => void;
+  afterExecute?: (
+    task: any,
+    profile: {
+      duration: number;
+      memoryDelta: number;
+      status: string;
+      error?: string;
+    }
+  ) => void;
 }
 
 export interface PoolInstance {
@@ -81,15 +94,25 @@ export interface PoolInstance {
   metrics: Metrics;
   pause(): void;
   resume(): void;
-  cancel(query: { id?: string | number; tag?: string } | ((task: any) => boolean)): number;
+  cancel(
+    query: { id?: string | number; tag?: string } | ((task: any) => boolean)
+  ): number;
   onIdle(): Promise<{ errors: Error[]; failed: boolean; metrics: Metrics }>;
   drain(): Promise<{ errors: Error[]; failed: boolean; metrics: Metrics }>;
   setConcurrency(limit: number): void;
   peek(): any;
-  clear(): void;
+  clear(): Promise<void>;
   remove(predicate: (item: any) => boolean): boolean;
-  map<T, R>(items: T[], fn: (item: T) => Promise<R>, opts?: number | TaskOptions): Promise<R[]>;
+  map<T, R>(
+    items: T[],
+    fn: (item: T) => Promise<R>,
+    opts?: number | TaskOptions
+  ): Promise<R[]>;
+  getWorkerHealth(): WorkerHealth[];
   useQueue(name: string, concurrency?: number): PoolInstance;
 }
 
-export default function leap(initialConcurrency: number, globalOptions?: GlobalOptions): PoolInstance;
+export default function leap(
+  initialConcurrency: number,
+  globalOptions?: GlobalOptions
+): PoolInstance;
