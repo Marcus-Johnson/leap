@@ -1,0 +1,35 @@
+{
+  "name": "leap", 
+  "version": "1.0.0",
+  "type": "module",
+  "description": "High-performance priority promise pool with concurrency control",
+  "author": "Marcus Johnson",
+  "license": "MIT",
+  "main": "src/index.js",
+  "types": "src/index.d.ts",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/marcus-johnson/leap.git"
+  },
+  "keywords": [
+    "promise-pool",
+    "priority-queue",
+    "concurrency",
+    "async",
+    "leap"
+  ]
+}
