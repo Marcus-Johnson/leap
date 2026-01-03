@@ -1,4 +1,4 @@
-# Leap [![CI](https://github.com/Marcus-Johnson/leap/actions/workflows/ci.yml/badge.svg)](https://github.com/Marcus-Johnson/leap/actions) 
+# Smart Pool [![CI](https://github.com/Marcus-Johnson/smart-pool/actions/workflows/ci.yml/badge.svg)](https://github.com/Marcus-Johnson/smart-pool/actions) 
 
 A high-performance, feature-rich task queue and concurrency management library for Node.js. Built for production workloads requiring advanced scheduling, priority management, batching, rate limiting, circuit breaking, worker thread support, and adaptive concurrency.
 
@@ -26,15 +26,15 @@ A high-performance, feature-rich task queue and concurrency management library f
 ## Installation
 
 ```bash
-npm install leap
+npm install smart-pool
 ```
 
 ## Quick Start
 
 ```javascript
-import leap from 'leap';
+import smartPool from 'smart-pool';
 
-const pool = leap(5);
+const pool = smartPool(5);
 
 const result = await pool(async () => {
   return 'Task completed';
@@ -45,7 +45,7 @@ console.log(result);
 
 ## API Reference
 
-### `leap(concurrency, options)`
+### `smartPool(concurrency, options)`
 
 Creates a new task pool instance.
 
@@ -314,7 +314,7 @@ Performance metrics object (read-only):
 Configure pool behavior during initialization:
 
 ```javascript
-const pool = leap(5, {
+const pool = smartPool(5, {
   // Queue Management
   maxQueueSize: 10000,
   
@@ -433,9 +433,9 @@ const pool = leap(5, {
 Simple task queue with priority management:
 
 ```javascript
-import leap from 'leap';
+import smartPool from 'smart-pool';
 
-const pool = leap(3);
+const pool = smartPool(3);
 
 await pool(async () => {
   console.log('Low priority task');
@@ -453,7 +453,7 @@ await pool.onIdle();
 Respect API rate limits with type-based limiting:
 
 ```javascript
-const pool = leap(10, {
+const pool = smartPool(10, {
   rateLimits: {
     github: { interval: 3600000, tasksPerInterval: 5000 },
     twitter: { interval: 900000, tasksPerInterval: 300 }
@@ -492,7 +492,7 @@ const users = await Promise.all([
 Batch database operations for efficiency:
 
 ```javascript
-const pool = leap(5, {
+const pool = smartPool(5, {
   batchSize: 50,
   batchTimeout: 100
 });
@@ -524,7 +524,7 @@ console.log(`Inserted ${ids.length} users in batches`);
 Protect external services from cascading failures:
 
 ```javascript
-const pool = leap(5, {
+const pool = smartPool(5, {
   circuitThreshold: 3,
   circuitResetTimeout: 30000,
   retryCount: 2,
@@ -574,7 +574,7 @@ function expensiveComputation(n) {
 
 **main.js:**
 ```javascript
-const pool = leap(5, {
+const pool = smartPool(5, {
   workerPoolSize: 4,
   workerPathWhitelist: ['/app/workers/']
 });
@@ -602,7 +602,7 @@ console.log(results);
 Execute tasks after dependencies complete:
 
 ```javascript
-const pool = leap(10);
+const pool = smartPool(10);
 
 const userId = await pool(
   async () => db.users.create({ name: 'Alice' }),
@@ -625,7 +625,7 @@ await pool(
 Deduplicate identical pending requests:
 
 ```javascript
-const pool = leap(5);
+const pool = smartPool(5);
 
 async function fetchUserData(userId) {
   return pool(
@@ -652,7 +652,7 @@ console.log('Only one request made');
 Automatically adjust concurrency based on performance:
 
 ```javascript
-const pool = leap(5, {
+const pool = smartPool(5, {
   adaptive: true,
   minConcurrency: 2,
   maxConcurrency: 20,
@@ -680,7 +680,7 @@ await pool.onIdle();
 Prevent task starvation with automatic priority boosts:
 
 ```javascript
-const pool = leap(3, {
+const pool = smartPool(3, {
   agingThreshold: 5,
   agingBoost: 1,
   interval: 1000
@@ -704,7 +704,7 @@ await pool.onIdle();
 Isolate different workload types:
 
 ```javascript
-const pool = leap(10);
+const pool = smartPool(10);
 
 const criticalQueue = pool.useQueue('critical', 5);
 const backgroundQueue = pool.useQueue('background', 2);
@@ -726,7 +726,7 @@ console.log(`Background active: ${backgroundQueue.activeCount}`);
 Cancel tasks via timeout or AbortSignal:
 
 ```javascript
-const pool = leap(5);
+const pool = smartPool(5);
 
 const controller = new AbortController();
 
@@ -758,7 +758,7 @@ try {
 Track performance metrics:
 
 ```javascript
-const pool = leap(10);
+const pool = smartPool(10);
 
 for (let i = 0; i < 1000; i++) {
   pool(async () => {
@@ -782,7 +782,7 @@ console.log(`Latency p99: ${metrics.percentiles.p99}ms`);
 Monitor task execution:
 
 ```javascript
-const pool = leap(5, {
+const pool = smartPool(5, {
   onEnqueue: (task) => {
     console.log(`[ENQUEUE] ${task.id || 'anonymous'} (priority: ${task.priority})`);
   },
@@ -810,7 +810,7 @@ await pool(async () => {
 Track and limit load by task weight:
 
 ```javascript
-const pool = leap(100);
+const pool = smartPool(100);
 
 async function cpuIntensiveTask() {
   return pool(
@@ -843,7 +843,7 @@ console.log(`Current load: ${pool.currentLoad}`);
 Cancel tasks by ID, tag, or predicate:
 
 ```javascript
-const pool = leap(5);
+const pool = smartPool(5);
 
 for (let i = 0; i < 100; i++) {
   pool(
@@ -884,7 +884,7 @@ When an emitter is provided, the pool emits these events:
 import { EventEmitter } from 'events';
 
 const emitter = new EventEmitter();
-const pool = leap(5, { emitter });
+const pool = smartPool(5, { emitter });
 
 emitter.on('circuit:open', ({ type }) => {
   console.log(`Circuit opened for ${type}`);
@@ -906,7 +906,7 @@ emitter.on('task:retry', ({ id, attempt, delay }) => {
 Start conservative and adjust based on metrics:
 
 ```javascript
-const pool = leap(5, {
+const pool = smartPool(5, {
   adaptive: true,
   minConcurrency: 2,
   maxConcurrency: 20
@@ -918,7 +918,7 @@ const pool = leap(5, {
 Respect external API limits:
 
 ```javascript
-const pool = leap(10, {
+const pool = smartPool(10, {
   rateLimits: {
     'api-provider': { interval: 60000, tasksPerInterval: 100 }
   }
@@ -930,7 +930,7 @@ const pool = leap(10, {
 Protect against cascading failures:
 
 ```javascript
-const pool = leap(5, {
+const pool = smartPool(5, {
   circuitThreshold: 5,
   circuitResetTimeout: 30000,
   retryCount: 3
@@ -942,7 +942,7 @@ const pool = leap(5, {
 Reduce overhead for bulk operations:
 
 ```javascript
-const pool = leap(5, {
+const pool = smartPool(5, {
   batchSize: 100,
   batchTimeout: 50
 });

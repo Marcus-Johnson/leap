@@ -1,5 +1,5 @@
 {
-  "name": "leap",
+  "name": "smart-queue",
   "version": "1.0.0",
   "type": "module",
   "description": "High-performance priority promise pool with concurrency control",
